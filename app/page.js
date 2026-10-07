@@ -49,13 +49,13 @@ function addDate(list, date) {
 }
 
 // ── Editable text field (commits on blur / Enter, Esc reverts) ──────
-function EditableText({ value, onCommit, style, placeholder, validate }) {
+function EditableText({ value, onCommit, style, placeholder, validate, allowEmpty, title }) {
   const [draft, setDraft] = useState(value);
   useEffect(() => setDraft(value), [value]);
 
   function commit() {
     const next = draft.trim();
-    if (!next || next === value) { setDraft(value); return; }
+    if ((!next && !allowEmpty) || next === value) { setDraft(value); return; }
     if (validate && !validate(next)) { setDraft(value); return; }
     onCommit(next);
   }
@@ -66,6 +66,7 @@ function EditableText({ value, onCommit, style, placeholder, validate }) {
       className="inline-edit"
       value={draft}
       placeholder={placeholder}
+      title={title}
       onChange={(e) => setDraft(e.target.value)}
       onBlur={commit}
       onKeyDown={(e) => {
@@ -974,37 +975,53 @@ export default function MeetingPage() {
                 </button>
               </div>
 
-              {/* Metrics from Portfolio DB */}
+              {/* Metrics: typed values are saved to the sheet (columns D:H) and
+                  override the Portfolio DB figures; clear a field to fall back. */}
               {(() => {
                 const key = (selectedCo.name || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-                const m = portfolioMetrics.byName?.[key];
-                const growth = m?.growth || '';
-                const period = (m?.growthPeriod || '').toUpperCase();
-                const growthColor = growth.startsWith('+')
-                  ? 'var(--green)'
-                  : growth.startsWith('-')
-                  ? 'var(--red)'
-                  : 'var(--cream)';
-                const showPeriodTag = growth && period && period !== 'YOY';
+                const m = portfolioMetrics.byName?.[key] || {};
+                const fields = [
+                  { key: 'arr', label: 'ARR / Rev', fallback: m.arr },
+                  { key: 'growth', label: 'Growth YOY', fallback: m.growth, period: m.growthPeriod },
+                  { key: 'runway', label: 'Runway', fallback: m.runway },
+                  { key: 'raised', label: 'Amount Raised' },
+                  { key: 'scopInvestment', label: 'ScOp Investment' },
+                ];
                 return (
                   <div style={styles.metricsRow}>
-                    <div style={styles.metricCell}>
-                      <span style={styles.metricLabel}>ARR / Rev</span>
-                      <span style={styles.metricValue}>{m?.arr || '—'}</span>
-                    </div>
-                    <div style={styles.metricCell}>
-                      <span style={styles.metricLabel}>Growth YOY</span>
-                      <span style={{ ...styles.metricValue, color: growthColor, display: 'inline-flex', alignItems: 'baseline', gap: '8px' }}>
-                        {growth || '—'}
-                        {showPeriodTag && (
-                          <span style={styles.metricPeriodTag}>{period}</span>
-                        )}
-                      </span>
-                    </div>
-                    <div style={styles.metricCell}>
-                      <span style={styles.metricLabel}>Runway</span>
-                      <span style={styles.metricValue}>{m?.runway || '—'}</span>
-                    </div>
+                    {fields.map((f) => {
+                      const override = (selectedCo[f.key] || '').trim();
+                      const value = override || f.fallback || '';
+                      const color = f.key === 'growth' && value.startsWith('+')
+                        ? 'var(--green)'
+                        : f.key === 'growth' && value.startsWith('-')
+                        ? 'var(--red)'
+                        : 'var(--cream)';
+                      const period = !override && value ? (f.period || '').toUpperCase() : '';
+                      return (
+                        <div key={f.key} style={styles.metricCell}>
+                          <span style={styles.metricLabel}>
+                            {f.label}
+                            {period && period !== 'YOY' && (
+                              <span style={{ ...styles.metricPeriodTag, marginLeft: '6px' }}>{period}</span>
+                            )}
+                          </span>
+                          <EditableText
+                            key={`${f.key}-${selectedCompany}`}
+                            value={value}
+                            allowEmpty
+                            placeholder="—"
+                            title={override
+                              ? 'Saved in the Google Sheet. Clear to use the Portfolio DB value.'
+                              : f.fallback
+                              ? 'From the Portfolio DB. Type to override (saved to the Google Sheet).'
+                              : 'Type a value (saved to the Google Sheet).'}
+                            style={{ ...styles.metricValue, color, width: '100%' }}
+                            onCommit={(v) => dispatch({ type: 'UPDATE_COMPANY', index: selectedCompany, field: f.key, value: v })}
+                          />
+                        </div>
+                      );
+                    })}
                   </div>
                 );
               })()}
@@ -1456,7 +1473,7 @@ const styles = {
   },
   metricsRow: {
     display: 'grid',
-    gridTemplateColumns: 'repeat(3, 1fr)',
+    gridTemplateColumns: 'repeat(5, 1fr)',
     gap: '1px',
     marginTop: '20px',
     background: 'var(--cream-12)',
