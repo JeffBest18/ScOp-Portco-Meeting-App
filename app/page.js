@@ -82,7 +82,7 @@ function EditableText({ value, onCommit, style, placeholder, validate, allowEmpt
 function appReducer(state, action) {
   switch (action.type) {
     case 'LOAD_DATA':
-      return { ...state, ...action.payload, dirtyDates: [], companiesDirty: false, renamedDates: {}, loading: false };
+      return { ...state, ...action.payload, ...CLEAN, loading: false };
     case 'SELECT_DATE':
       return { ...state, activeDate: action.date };
     case 'SELECT_COMPANY':
@@ -92,12 +92,17 @@ function appReducer(state, action) {
       const date = action.date || state.activeDate;
       const newNotes = { ...state.notes, [date]: { ...(state.notes[date] || {}) } };
       newNotes[date][action.company] = action.text;
-      return { ...state, notes: newNotes, dirty: true, dirtyDates: addDate(state.dirtyDates, date) };
+      const dirtyCells = { ...state.dirtyCells, [date]: { ...(state.dirtyCells[date] || {}), [action.company]: true } };
+      return { ...state, notes: newNotes, dirty: true, dirtyDates: addDate(state.dirtyDates, date), dirtyCells };
     }
     case 'UPDATE_GENERAL_NOTES': {
       const newGeneral = { ...state.generalNotes };
       newGeneral[state.activeDate] = action.text;
-      return { ...state, generalNotes: newGeneral, dirty: true, dirtyDates: addDate(state.dirtyDates, state.activeDate) };
+      return {
+        ...state, generalNotes: newGeneral, dirty: true,
+        dirtyDates: addDate(state.dirtyDates, state.activeDate),
+        dirtyGeneral: addDate(state.dirtyGeneral, state.activeDate),
+      };
     }
     case 'UPDATE_COMPANY': {
       // Notes are keyed by company name, so a rename moves every week's note.
@@ -113,7 +118,15 @@ function appReducer(state, action) {
           newNotes[date] = moved !== undefined ? { ...rest, [action.value]: moved } : { ...rest };
         }
       }
-      return { ...state, companies: newCompanies, notes: newNotes, dirty: true, companiesDirty: true };
+      let dirtyCells = state.dirtyCells;
+      if (action.field === 'name' && action.value !== old.name) {
+        dirtyCells = {};
+        for (const [date, byCo] of Object.entries(state.dirtyCells)) {
+          const { [old.name]: was, ...rest } = byCo;
+          dirtyCells[date] = was ? { ...rest, [action.value]: true } : rest;
+        }
+      }
+      return { ...state, companies: newCompanies, notes: newNotes, dirtyCells, dirty: true, companiesDirty: true };
     }
     case 'RENAME_DATE': {
       // Move every per-date map to the new label. renamedDates remembers the
@@ -134,6 +147,8 @@ function appReducer(state, action) {
         generalNotes: moveKey(state.generalNotes),
         activeDate: state.activeDate === from ? to : state.activeDate,
         dirtyDates: addDate(state.dirtyDates.filter((d) => d !== from), to),
+        dirtyCells: moveKey(state.dirtyCells),
+        dirtyGeneral: state.dirtyGeneral.map((d) => (d === from ? to : d)),
         renamedDates,
         dirty: true,
       };
@@ -163,6 +178,7 @@ function appReducer(state, action) {
         activeDate: newDate,
         dirty: true,
         dirtyDates: addDate(state.dirtyDates, newDate),
+        dirtyGeneral: addDate(state.dirtyGeneral, newDate),
       };
     }
     case 'SET_SAVING':
@@ -174,11 +190,21 @@ function appReducer(state, action) {
     case 'SET_DIRTY':
       return action.dirty
         ? { ...state, dirty: true }
-        : { ...state, dirty: false, dirtyDates: [], companiesDirty: false, renamedDates: {} };
+        : { ...state, dirty: false, ...CLEAN };
     default:
       return state;
   }
 }
+
+// Edit tracking. Save writes only cells the user actually changed, so
+// untouched notes in the sheet (and their formatting) are never rewritten.
+const CLEAN = {
+  dirtyDates: [], // weeks with any edit
+  dirtyCells: {}, // date → { companyName: true } notes edited
+  dirtyGeneral: [], // weeks whose general notes were edited (or created)
+  companiesDirty: false, // name/analyst/partner/metrics edited — rewrite A:H
+  renamedDates: {}, // new date label → label still in the sheet's row 5
+};
 
 const initialState = {
   companies: [],
@@ -190,9 +216,7 @@ const initialState = {
   selectedCompany: 0,
   loading: true,
   dirty: false,
-  dirtyDates: [], // weeks edited since last load/save — all get written on save
-  companiesDirty: false, // name/analyst/partner edited — rewrite columns A:C
-  renamedDates: {}, // new date label → label still in the sheet's row 5
+  ...CLEAN,
   saveState: 'idle', // idle | saving | success
   showActionItems: false,
 };
@@ -533,8 +557,11 @@ export default function MeetingPage() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             date,
-            notes: notes[date] || {},
-            generalNotes: generalNotes[date] || '',
+            // Only the edited cells; the server leaves every other cell alone.
+            notes: Object.fromEntries(
+              Object.keys(state.dirtyCells[date] || {}).map((co) => [co, notes[date]?.[co] || ''])
+            ),
+            generalNotes: state.dirtyGeneral.includes(date) ? (generalNotes[date] || '') : undefined,
             actionItems: isActive ? actionItemsText : undefined,
             companies,
             // Company name/analyst/partner only need writing once per save.
