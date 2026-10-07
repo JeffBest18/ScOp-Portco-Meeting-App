@@ -3,7 +3,7 @@
 import { useState, useReducer, useEffect, useCallback, useRef } from 'react';
 import {
   Search, Plus, User, Users, Clock, ChevronRight, ChevronDown,
-  Save, Loader2, Check, X, Copy, CalendarPlus, AlertCircle, RefreshCw,
+  Save, Loader2, Check, X, Copy, CalendarPlus, AlertCircle, RefreshCw, Trash2,
 } from 'lucide-react';
 import { TEAM_MEMBERS, LOGO_MAP } from '@/lib/mockData';
 import { parseActionItems, groupActionsByOwner, formatForSlack } from '@/lib/actionParser';
@@ -81,7 +81,7 @@ function EditableText({ value, onCommit, style, placeholder, validate }) {
 function appReducer(state, action) {
   switch (action.type) {
     case 'LOAD_DATA':
-      return { ...state, ...action.payload, dirtyDates: [], companiesDirty: false, loading: false };
+      return { ...state, ...action.payload, dirtyDates: [], companiesDirty: false, renamedDates: {}, loading: false };
     case 'SELECT_DATE':
       return { ...state, activeDate: action.date };
     case 'SELECT_COMPANY':
@@ -114,6 +114,37 @@ function appReducer(state, action) {
       }
       return { ...state, companies: newCompanies, notes: newNotes, dirty: true, companiesDirty: true };
     }
+    case 'RENAME_DATE': {
+      // Move every per-date map to the new label. renamedDates remembers the
+      // label the sheet still has, so save can find and rewrite that column.
+      const { from, to } = action;
+      const moveKey = (obj) => {
+        const { [from]: v, ...rest } = obj;
+        return v !== undefined ? { ...rest, [to]: v } : rest;
+      };
+      const renamedDates = { ...state.renamedDates };
+      const original = renamedDates[from] ?? from;
+      delete renamedDates[from];
+      if (original !== to) renamedDates[to] = original;
+      return {
+        ...state,
+        dates: state.dates.map((d) => (d === from ? to : d)),
+        notes: moveKey(state.notes),
+        generalNotes: moveKey(state.generalNotes),
+        activeDate: state.activeDate === from ? to : state.activeDate,
+        dirtyDates: addDate(state.dirtyDates.filter((d) => d !== from), to),
+        renamedDates,
+        dirty: true,
+      };
+    }
+    case 'REMOVE_COMPANY': {
+      const newCompanies = state.companies.filter((_, i) => i !== action.index);
+      return {
+        ...state,
+        companies: newCompanies,
+        selectedCompany: Math.min(state.selectedCompany, Math.max(newCompanies.length - 1, 0)),
+      };
+    }
     case 'ADD_COMPANY': {
       const newCompanies = [action.company, ...state.companies];
       return { ...state, companies: newCompanies, selectedCompany: 0, dirty: true };
@@ -142,7 +173,7 @@ function appReducer(state, action) {
     case 'SET_DIRTY':
       return action.dirty
         ? { ...state, dirty: true }
-        : { ...state, dirty: false, dirtyDates: [], companiesDirty: false };
+        : { ...state, dirty: false, dirtyDates: [], companiesDirty: false, renamedDates: {} };
     default:
       return state;
   }
@@ -160,6 +191,7 @@ const initialState = {
   dirty: false,
   dirtyDates: [], // weeks edited since last load/save — all get written on save
   companiesDirty: false, // name/analyst/partner edited — rewrite columns A:C
+  renamedDates: {}, // new date label → label still in the sheet's row 5
   saveState: 'idle', // idle | saving | success
   showActionItems: false,
 };
@@ -342,6 +374,7 @@ export default function MeetingPage() {
   const [toasts, setToasts] = useState([]);
   const [portfolioMetrics, setPortfolioMetrics] = useState({ byName: {} });
   const [reverseSyncing, setReverseSyncing] = useState(false);
+  const [editingDate, setEditingDate] = useState(null);
   const noteRef = useRef(null);
   const companyListRef = useRef(null);
 
@@ -505,6 +538,7 @@ export default function MeetingPage() {
             companies,
             // Company name/analyst/partner only need writing once per save.
             writeCompanyInfo: i === 0 && state.companiesDirty,
+            renameFrom: state.renamedDates[date],
           }),
         });
 
@@ -563,6 +597,52 @@ export default function MeetingPage() {
     const newDate = getNextWednesday(lastDate);
     dispatch({ type: 'NEW_WEEK', date: newDate });
     addToast(`New week created: ${newDate}`);
+  }
+
+  // ── Rename date handler ───────────────────────────────
+  function handleRenameDate(from, to) {
+    setEditingDate(null);
+    if (!to || to === from) return;
+    if (!/^\d{1,2}\/\d{1,2}$/.test(to)) {
+      addToast('Use M/D format, e.g. 10/8', 'error');
+      return;
+    }
+    if (dates.includes(to)) {
+      addToast(`${to} already exists`, 'error');
+      return;
+    }
+    dispatch({ type: 'RENAME_DATE', from, to });
+  }
+
+  // ── Remove company handler ────────────────────────────
+  // Deletes the company's row in the sheet immediately (like Add Company).
+  async function handleRemoveCompany(index) {
+    const company = companies[index];
+    if (!company) return;
+    if (state.companiesDirty) {
+      addToast('Save & Sync your company edits before removing a company', 'error');
+      return;
+    }
+    const ok = window.confirm(
+      `Remove ${company.name} from the portfolio meeting? This deletes its row (and all its notes) from the Google Sheet.`
+    );
+    if (!ok) return;
+    try {
+      const res = await authedFetch('/api/sheet/delete-company', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: company.name }),
+      });
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({}));
+        throw new Error(detail.message || `HTTP ${res.status}`);
+      }
+      dispatch({ type: 'REMOVE_COMPANY', index });
+      addToast(`${company.name} removed`);
+    } catch (err) {
+      console.error('Remove company error:', err);
+      addToast(`Failed to remove: ${err.message}`, 'error');
+    }
   }
 
   // ── Add company handler ───────────────────────────────
@@ -711,16 +791,35 @@ export default function MeetingPage() {
       <div style={styles.dateBar}>
         <div style={styles.dateTabs}>
           {dates.map((date) => (
-            <button
-              key={date}
-              onClick={() => dispatch({ type: 'SELECT_DATE', date })}
-              style={{
-                ...styles.dateTab,
-                ...(date === activeDate ? styles.dateTabActive : {}),
-              }}
-            >
-              {date}
-            </button>
+            editingDate === date ? (
+              <input
+                key={date}
+                type="text"
+                className="inline-edit"
+                defaultValue={date}
+                autoFocus
+                onFocus={(e) => e.target.select()}
+                onBlur={(e) => handleRenameDate(date, e.target.value.trim())}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') e.currentTarget.blur();
+                  if (e.key === 'Escape') setEditingDate(null);
+                }}
+                style={{ ...styles.dateTab, ...styles.dateTabActive, width: '56px' }}
+              />
+            ) : (
+              <button
+                key={date}
+                onClick={() => dispatch({ type: 'SELECT_DATE', date })}
+                onDoubleClick={() => setEditingDate(date)}
+                title="Double-click to rename"
+                style={{
+                  ...styles.dateTab,
+                  ...(date === activeDate ? styles.dateTabActive : {}),
+                }}
+              >
+                {date}
+              </button>
+            )
           ))}
         </div>
         <button
@@ -865,6 +964,14 @@ export default function MeetingPage() {
                     </span>
                   </div>
                 </div>
+                <button
+                  className="btn btn-ghost"
+                  onClick={() => handleRemoveCompany(selectedCompany)}
+                  title="Remove company (deletes its row in the Google Sheet)"
+                  style={{ padding: '6px 10px', fontSize: '12px', flexShrink: 0 }}
+                >
+                  <Trash2 size={13} /> Remove
+                </button>
               </div>
 
               {/* Metrics from Portfolio DB */}

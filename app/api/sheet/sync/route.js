@@ -4,13 +4,13 @@ import { syncToSheet } from '@/lib/sheets';
 export async function POST(request) {
   try {
     const body = await request.json();
-    const { date, notes, generalNotes, actionItems, companies, writeCompanyInfo } = body;
+    const { date, notes, generalNotes, actionItems, companies, writeCompanyInfo, renameFrom } = body;
 
     if (!date) {
       return NextResponse.json({ error: 'Date is required' }, { status: 400 });
     }
 
-    const result = await syncToSheet({ date, notes, generalNotes, actionItems, companies, writeCompanyInfo });
+    const result = await syncToSheet({ date, notes, generalNotes, actionItems, companies, writeCompanyInfo, renameFrom });
     return NextResponse.json(result);
   } catch (error) {
     console.error('Sheet sync error:', error);
