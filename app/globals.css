@@ -297,3 +297,20 @@ select {
   animation: slideDown 400ms ease forwards;
   overflow: hidden;
 }
+
+/* Inline-editable fields (company name, analyst, partner): look like text
+   until hovered/focused so the detail header keeps its original design. */
+input.inline-edit[type="text"] {
+  background: transparent;
+  border: 1px solid transparent;
+  padding: 2px 4px;
+  margin-left: -4px;
+  font-family: inherit;
+}
+input.inline-edit[type="text"]:hover {
+  border-color: var(--cream-08);
+}
+input.inline-edit[type="text"]:focus {
+  border-color: var(--cream-20);
+  background: var(--surface-2);
+}

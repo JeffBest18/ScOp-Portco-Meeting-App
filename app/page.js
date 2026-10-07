@@ -44,25 +44,75 @@ function getNextWednesday(lastDateStr) {
   return `${d.getMonth() + 1}/${d.getDate()}`;
 }
 
+function addDate(list, date) {
+  return list.includes(date) ? list : [...list, date];
+}
+
+// ── Editable text field (commits on blur / Enter, Esc reverts) ──────
+function EditableText({ value, onCommit, style, placeholder, validate }) {
+  const [draft, setDraft] = useState(value);
+  useEffect(() => setDraft(value), [value]);
+
+  function commit() {
+    const next = draft.trim();
+    if (!next || next === value) { setDraft(value); return; }
+    if (validate && !validate(next)) { setDraft(value); return; }
+    onCommit(next);
+  }
+
+  return (
+    <input
+      type="text"
+      className="inline-edit"
+      value={draft}
+      placeholder={placeholder}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') e.currentTarget.blur();
+        if (e.key === 'Escape') { setDraft(value); setTimeout(() => e.target.blur()); }
+      }}
+      style={style}
+    />
+  );
+}
+
 // ── State Reducer ──────────────────────────────────────────────────
 function appReducer(state, action) {
   switch (action.type) {
     case 'LOAD_DATA':
-      return { ...state, ...action.payload, loading: false };
+      return { ...state, ...action.payload, dirtyDates: [], companiesDirty: false, loading: false };
     case 'SELECT_DATE':
       return { ...state, activeDate: action.date };
     case 'SELECT_COMPANY':
       return { ...state, selectedCompany: action.index };
     case 'UPDATE_NOTE': {
-      const newNotes = { ...state.notes };
-      if (!newNotes[state.activeDate]) newNotes[state.activeDate] = {};
-      newNotes[state.activeDate][action.company] = action.text;
-      return { ...state, notes: newNotes, dirty: true };
+      // action.date lets past weeks be edited; defaults to the active week.
+      const date = action.date || state.activeDate;
+      const newNotes = { ...state.notes, [date]: { ...(state.notes[date] || {}) } };
+      newNotes[date][action.company] = action.text;
+      return { ...state, notes: newNotes, dirty: true, dirtyDates: addDate(state.dirtyDates, date) };
     }
     case 'UPDATE_GENERAL_NOTES': {
       const newGeneral = { ...state.generalNotes };
       newGeneral[state.activeDate] = action.text;
-      return { ...state, generalNotes: newGeneral, dirty: true };
+      return { ...state, generalNotes: newGeneral, dirty: true, dirtyDates: addDate(state.dirtyDates, state.activeDate) };
+    }
+    case 'UPDATE_COMPANY': {
+      // Notes are keyed by company name, so a rename moves every week's note.
+      const old = state.companies[action.index];
+      if (!old) return state;
+      const updated = { ...old, [action.field]: action.value };
+      const newCompanies = state.companies.map((c, i) => (i === action.index ? updated : c));
+      let newNotes = state.notes;
+      if (action.field === 'name' && action.value !== old.name) {
+        newNotes = {};
+        for (const [date, byCo] of Object.entries(state.notes)) {
+          const { [old.name]: moved, ...rest } = byCo || {};
+          newNotes[date] = moved !== undefined ? { ...rest, [action.value]: moved } : { ...rest };
+        }
+      }
+      return { ...state, companies: newCompanies, notes: newNotes, dirty: true, companiesDirty: true };
     }
     case 'ADD_COMPANY': {
       const newCompanies = [action.company, ...state.companies];
@@ -80,6 +130,7 @@ function appReducer(state, action) {
         generalNotes: newGeneral,
         activeDate: newDate,
         dirty: true,
+        dirtyDates: addDate(state.dirtyDates, newDate),
       };
     }
     case 'SET_SAVING':
@@ -89,7 +140,9 @@ function appReducer(state, action) {
     case 'DISMISS_ACTION_ITEMS':
       return { ...state, showActionItems: false };
     case 'SET_DIRTY':
-      return { ...state, dirty: action.dirty };
+      return action.dirty
+        ? { ...state, dirty: true }
+        : { ...state, dirty: false, dirtyDates: [], companiesDirty: false };
     default:
       return state;
   }
@@ -105,6 +158,8 @@ const initialState = {
   selectedCompany: 0,
   loading: true,
   dirty: false,
+  dirtyDates: [], // weeks edited since last load/save — all get written on save
+  companiesDirty: false, // name/analyst/partner edited — rewrite columns A:C
   saveState: 'idle', // idle | saving | success
   showActionItems: false,
 };
@@ -432,26 +487,35 @@ export default function MeetingPage() {
       const grouped = groupActionsByOwner(allActions);
       const actionItemsText = formatForSlack(grouped);
 
-      // Sync to Google Sheets
-      const res = await authedFetch('/api/sheet/sync', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          date: activeDate,
-          notes: currentNotes,
-          generalNotes: generalNotes[activeDate] || '',
-          actionItems: actionItemsText,
-          companies,
-        }),
-      });
+      // Sync to Google Sheets: the active week plus every past week edited.
+      // Action items (row 4) are only recomputed for the active week; past
+      // weeks keep whatever the sheet already has.
+      const datesToSave = [activeDate, ...state.dirtyDates.filter((d) => d !== activeDate && dates.includes(d))];
+      for (let i = 0; i < datesToSave.length; i++) {
+        const date = datesToSave[i];
+        const isActive = date === activeDate;
+        const res = await authedFetch('/api/sheet/sync', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            date,
+            notes: notes[date] || {},
+            generalNotes: generalNotes[date] || '',
+            actionItems: isActive ? actionItemsText : undefined,
+            companies,
+            // Company name/analyst/partner only need writing once per save.
+            writeCompanyInfo: i === 0 && state.companiesDirty,
+          }),
+        });
 
-      if (!res.ok) {
-        // Read the structured error the server now returns so the console is actionable.
-        const detail = await res.json().catch(() => ({}));
-        console.error('Save failed:', res.status, detail);
-        const reason =
-          detail.hint || detail.message || `HTTP ${res.status}`;
-        throw new Error(reason);
+        if (!res.ok) {
+          // Read the structured error the server now returns so the console is actionable.
+          const detail = await res.json().catch(() => ({}));
+          console.error('Save failed:', res.status, detail);
+          const reason =
+            detail.hint || detail.message || `HTTP ${res.status}`;
+          throw new Error(datesToSave.length > 1 ? `${date}: ${reason}` : reason);
+        }
       }
 
       dispatch({ type: 'SET_ACTION_ITEMS', items: allActions });
@@ -765,14 +829,39 @@ export default function MeetingPage() {
             <>
               {/* Header */}
               <div style={styles.detailHeader}>
-                <div>
-                  <h2 style={styles.detailName}>{selectedCo.name}</h2>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <EditableText
+                    key={`name-${selectedCompany}`}
+                    value={selectedCo.name}
+                    style={{ ...styles.detailName, width: '100%' }}
+                    placeholder="Company name"
+                    validate={(next) => {
+                      const clash = companies.some((c, i) => i !== selectedCompany && c.name.toLowerCase() === next.toLowerCase());
+                      if (clash) addToast(`"${next}" already exists`, 'error');
+                      return !clash;
+                    }}
+                    onCommit={(v) => dispatch({ type: 'UPDATE_COMPANY', index: selectedCompany, field: 'name', value: v })}
+                  />
                   <div style={{ display: 'flex', gap: '12px', marginTop: '6px' }}>
                     <span style={styles.detailBadge}>
-                      <User size={12} /> {selectedCo.analyst}
+                      <User size={12} />
+                      <EditableText
+                        key={`analyst-${selectedCompany}`}
+                        value={selectedCo.analyst}
+                        placeholder="Analyst"
+                        style={styles.badgeInput}
+                        onCommit={(v) => dispatch({ type: 'UPDATE_COMPANY', index: selectedCompany, field: 'analyst', value: v })}
+                      />
                     </span>
                     <span style={styles.detailBadge}>
-                      <Users size={12} /> {selectedCo.partner}
+                      <Users size={12} />
+                      <EditableText
+                        key={`partner-${selectedCompany}`}
+                        value={selectedCo.partner}
+                        placeholder="Partner"
+                        style={styles.badgeInput}
+                        onCommit={(v) => dispatch({ type: 'UPDATE_COMPANY', index: selectedCompany, field: 'partner', value: v })}
+                      />
                     </span>
                   </div>
                 </div>
@@ -828,14 +917,17 @@ export default function MeetingPage() {
               </div>
 
               {/* Previous week's notes */}
-              {prevDate && prevNotes[selectedCo.name] && (
+              {prevDate && (prevNotes[selectedCo.name] || state.dirtyDates.includes(prevDate)) && (
                 <div style={{ marginTop: '20px' }}>
                   <label className="section-label" style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '8px' }}>
                     Previous Week · {prevDate}
                   </label>
-                  <div style={styles.prevNotes}>
-                    {prevNotes[selectedCo.name]}
-                  </div>
+                  <textarea
+                    value={prevNotes[selectedCo.name] || ''}
+                    onChange={(e) => dispatch({ type: 'UPDATE_NOTE', date: prevDate, company: selectedCo.name, text: e.target.value })}
+                    rows={4}
+                    style={styles.prevNotes}
+                  />
                 </div>
               )}
 
@@ -852,14 +944,17 @@ export default function MeetingPage() {
                   <div style={styles.historyList}>
                     {[...dates].reverse().map((date) => {
                       const note = notes[date]?.[selectedCo.name];
-                      if (!note) return null;
+                      if (!note && !state.dirtyDates.includes(date)) return null;
                       if (date === activeDate) return null;
                       return (
                         <div key={date} style={styles.historyItem}>
                           <span className="section-label" style={{ fontSize: '10px' }}>{date}</span>
-                          <p style={{ fontSize: '13px', color: 'var(--cream-60)', marginTop: '4px', lineHeight: '1.5' }}>
-                            {note}
-                          </p>
+                          <textarea
+                            value={note || ''}
+                            onChange={(e) => dispatch({ type: 'UPDATE_NOTE', date, company: selectedCo.name, text: e.target.value })}
+                            rows={3}
+                            style={{ fontSize: '13px', color: 'var(--cream-60)', marginTop: '4px', lineHeight: '1.5' }}
+                          />
                         </div>
                       );
                     })}
@@ -1238,6 +1333,11 @@ const styles = {
     fontWeight: 700,
     color: 'var(--cream-40)',
     flexShrink: 0,
+  },
+  badgeInput: {
+    fontSize: '12px',
+    color: 'var(--cream-60)',
+    width: '120px',
   },
   prevNotes: {
     padding: '12px 14px',
